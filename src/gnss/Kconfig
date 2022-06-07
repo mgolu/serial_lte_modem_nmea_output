@@ -31,4 +31,9 @@ config SLM_CELL_POS
 	help
 	  Request nRF Cloud cellular positioning service
 
+config SLM_NMEA_UART_2
+	bool "Use UART 2 for NMEA"
+	help
+	  Use UART 2 for NMEA
+
 endif # SLM_GNSS

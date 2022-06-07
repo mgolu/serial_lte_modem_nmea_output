@@ -17,6 +17,9 @@
 #include "slm_util.h"
 #include "slm_at_host.h"
 #include "slm_at_gnss.h"
+#if defined(CONFIG_SLM_NMEA_UART_2)
+#include <zephyr/drivers/uart.h>
+#endif
 
 LOG_MODULE_REGISTER(slm_gnss, CONFIG_SLM_LOG_LEVEL);
 
@@ -82,6 +85,11 @@ static struct lte_lc_cells_info cell_data = {
 	.neighbor_cells = neighbor_cells
 };
 static int ncell_meas_status;
+
+#if defined(CONFIG_SLM_NMEA_UART_2)
+static const struct device *uart_dev;
+struct uart_config slm_uart_config;
+#endif
 
 /* global variable defined in different files */
 extern struct k_work_q slm_work_q;
@@ -474,6 +482,45 @@ static void on_gnss_evt_agps_req(void)
 		k_work_submit_to_queue(&slm_work_q, &pgps_req);
 	}
 }
+#if defined(CONFIG_SLM_NMEA_UART_2)
+char nmea_buf[100];
+static void on_gnss_evt_nmea(void)
+{
+	int err = nrf_modem_gnss_read((void *)nmea_buf, sizeof(nmea_buf), NRF_MODEM_GNSS_DATA_NMEA);
+	if (err != 0) {
+		LOG_ERR("Failed to read NMEA data, error %d", err);
+		return;
+	}
+	err = uart_tx(uart_dev, nmea_buf, strlen(nmea_buf), SYS_FOREVER_US);
+	if (err != 0) {
+		LOG_ERR("Failed to send NMEA data, error %d", err);
+		return;
+	}
+}
+
+static void uart_callback(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+
+	switch (evt->type) {
+	case UART_TX_DONE:
+		LOG_DBG("UART_TX_DONE");
+		break;
+	case UART_TX_ABORTED:
+		LOG_INF("TX_ABORTED");
+		break;
+	case UART_RX_STOPPED:
+		LOG_WRN("RX_STOPPED (%d)", evt->data.rx_stop.reason);
+		break;
+	case UART_RX_DISABLED:
+		LOG_DBG("RX_DISABLED");
+		break;
+	default:
+		break;
+	}
+}
+#endif
 
 /* NOTE this event handler runs in interrupt context */
 static void gnss_event_handler(int event)
@@ -485,10 +532,11 @@ static void gnss_event_handler(int event)
 		break;
 	case NRF_MODEM_GNSS_EVT_FIX:
 		LOG_INF("GNSS_EVT_FIX");
-		on_gnss_evt_fix();
+		//on_gnss_evt_fix();
 		break;
 	case NRF_MODEM_GNSS_EVT_NMEA:
 		LOG_DBG("GNSS_EVT_NMEA");
+		on_gnss_evt_nmea();
 		break;
 	case NRF_MODEM_GNSS_EVT_AGPS_REQ:
 		LOG_INF("GNSS_EVT_AGPS_REQ");
@@ -717,6 +765,11 @@ int handle_at_gps(enum at_cmd_type cmd_type)
 			err = nrf_modem_gnss_fix_interval_set(interval);
 			if (err) {
 				LOG_ERR("Failed to set fix interval, error: %d", err);
+				return err;
+			}
+			err = nrf_modem_gnss_nmea_mask_set(NRF_MODEM_GNSS_NMEA_GGA_MASK);
+			if (err) {
+				LOG_ERR("Failed to set GNSS NMEA mask");
 				return err;
 			}
 			if (at_params_unsigned_short_get(&at_param_list, 3, &timeout) == 0) {
@@ -1109,6 +1162,40 @@ int slm_at_gnss_init(void)
 
 		nrf_cloud_initd = true;
 	}
+#if defined(CONFIG_SLM_NMEA_UART_2)
+	uart_dev = device_get_binding(DT_LABEL(DT_NODELABEL(uart2)));
+	if (uart_dev == NULL) {
+		LOG_ERR("Cannot bind UART device for NMEA output\n");
+	}
+	slm_uart_config.baudrate = 115200;
+	slm_uart_config.data_bits = UART_CFG_DATA_BITS_8;
+	slm_uart_config.parity = UART_CFG_PARITY_NONE;
+	slm_uart_config.stop_bits = UART_CFG_STOP_BITS_1;
+	slm_uart_config.flow_ctrl = UART_CFG_FLOW_CTRL_NONE;
+
+	err = uart_configure(uart_dev, &slm_uart_config);
+	if (err != 0) {
+		LOG_ERR("uart_configure: %d", err);
+	}
+
+	uint32_t start_time = k_uptime_get_32();
+	do {
+		err = uart_err_check(uart_dev);
+		if (err) {
+			uint32_t now = k_uptime_get_32();
+
+			if (now - start_time > 500) {
+				LOG_ERR("UART check failed: %d", err);
+				return -EIO;
+			}
+			k_sleep(K_MSEC(10));
+		}
+	} while (err); 
+	err = uart_callback_set(uart_dev, uart_callback, NULL);
+	if (err) {
+		LOG_ERR("Cannot set callback: %d", err);
+	}
+#endif
 
 	k_work_init(&agps_req, agps_req_wk);
 	k_work_init(&pgps_req, pgps_req_wk);
